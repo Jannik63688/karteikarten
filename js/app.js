@@ -3,7 +3,7 @@ import { schedule, newSrs, previewLabels, dayKey, relDue, fmtDays } from './srs.
 import { parseCards, CLAUDE_PROMPT } from './parser.js';
 import { RATINGS, knowledge, isMastered, deckKnowledge, scoreColor, distribution, weakest, HISTORY_MAX } from './score.js';
 
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
 /* ================= Hilfsfunktionen ================= */
@@ -1571,6 +1571,7 @@ function startLearn({ deckIds = [], cardIds = null, practice = false }) {
     el.classList.remove('open');
     setTimeout(() => el.remove(), 520);
     refresh();
+    if (reloadPending) setTimeout(() => location.reload(), 600);
   }
 
   function edit() {
@@ -2225,7 +2226,9 @@ function SettingsView() {
         <div class="section-footer">Deine Karten liegen nur auf diesem Gerät. Sichere sie ab und zu, z. B. in iCloud Drive.</div></div>
       <div class="section"><div class="section-header">Hilfe</div><div class="group has-tiles">
         <button class="row" data-a="help"><span class="tile" style="background:var(--accent)">${I.book}</span>
-          <span class="row-main"><span class="row-title">Anleitung</span></span><span class="chev">${I.chev}</span></button></div></div>
+          <span class="row-main"><span class="row-title">Anleitung</span></span><span class="chev">${I.chev}</span></button>
+        <button class="row" data-a="update"><span class="tile" style="background:var(--teal)">🔄</span>
+          <span class="row-main"><span class="row-title">App aktualisieren</span><span class="row-sub">Version ${APP_VERSION} · lädt die neueste Version</span></span></button></div></div>
       <div class="section"><div class="group"><button class="row center danger" data-a="wipe"><span class="row-title">Alle Daten löschen</span></button></div>
         <div class="section-footer" data-info>Version ${APP_VERSION} · ${plural(S.decks.length, 'Stapel', 'Stapel')} · ${plural(S.cards.length, 'Karte', 'Karten')}</div></div>
       <input type="file" class="hidden" accept=".json,application/json,.txt,text/plain" data-restore>`;
@@ -2259,6 +2262,7 @@ function SettingsView() {
       case 'backup': createBackup(); break;
       case 'restore': $('[data-restore]', v.content).click(); break;
       case 'help': pushView(HelpView()); break;
+      case 'update': forceUpdate(); break;
       case 'wipe': {
         if (!(await confirmBox('Alle Daten löschen?', 'Alle Stapel, Karten, Bilder und Lernfortschritte werden von diesem Gerät gelöscht. Erstelle vorher ein Backup, falls du sie behalten willst.', 'Alles löschen'))) return;
         await db.bulk(db.STORES.map((s) => ({ store: s, op: 'clear' })));
@@ -2312,29 +2316,50 @@ function HelpView() {
 }
 
 /* ================= Service Worker ================= */
+let swReg = null;
+let reloadPending = false;
+
+/** Neu laden – aber nie mitten in einer Lernrunde. */
+function reloadForUpdate() {
+  if (learnOpen) {
+    reloadPending = true;
+    return;
+  }
+  location.reload();
+}
+
 function registerSW() {
   if (!('serviceWorker' in navigator)) return;
   const hadController = !!navigator.serviceWorker.controller;
   navigator.serviceWorker
-    .register('sw.js')
+    .register('sw.js', { updateViaCache: 'none' })
     .then((reg) => {
-      const notify = (w) => toast('Neue Version verfügbar', { text: 'Aktualisieren', fn: () => w.postMessage('skipWaiting') });
-      if (reg.waiting && hadController) notify(reg.waiting);
+      swReg = reg;
+      if (reg.waiting) reg.waiting.postMessage('skipWaiting'); // alte, hängende Version ablösen
       reg.addEventListener('updatefound', () => {
         const w = reg.installing;
         w?.addEventListener('statechange', () => {
-          if (w.state === 'installed' && navigator.serviceWorker.controller) notify(w);
+          if (w.state === 'installed' && navigator.serviceWorker.controller) w.postMessage('skipWaiting');
         });
       });
-      document.addEventListener('visibilitychange', () => { if (!document.hidden) reg.update().catch(() => {}); });
+      const check = () => reg.update().catch(() => {});
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) check(); });
+      setInterval(check, 30 * 60_000);
     })
     .catch(() => {});
   let reloading = false;
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     if (!hadController || reloading) return;
     reloading = true;
-    location.reload();
+    reloadForUpdate();
   });
+}
+
+/** Manuell: nach Updates suchen und die App frisch laden (Daten bleiben erhalten). */
+async function forceUpdate() {
+  toast('Suche nach Updates …');
+  try { await swReg?.update(); } catch { /* offline */ }
+  setTimeout(() => location.reload(), 1200);
 }
 
 /* ================= Start ================= */

@@ -1,6 +1,8 @@
 // Service Worker: macht die App offline nutzbar.
-// Bei jeder Änderung an den Dateien VERSION erhöhen.
-const VERSION = 'v1.2.0';
+// Strategie: online immer zuerst die aktuelle Version vom Server holen (network-first),
+// nur ohne Verbindung (oder bei sehr langsamer) aus dem Offline-Speicher laden.
+// Neue Versionen werden sofort aktiv; die Seite lädt sich dann selbst neu.
+const VERSION = 'v1.3.0';
 const CACHE = `karteikarten-${VERSION}`;
 const ASSETS = [
   './',
@@ -18,8 +20,10 @@ const ASSETS = [
   './icons/icon-512.png',
   './icons/icon-maskable-512.png',
 ];
+const NETWORK_TIMEOUT = 4000;
 
 self.addEventListener('install', (e) => {
+  self.skipWaiting(); // nicht auf das Schließen aller Fenster warten
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS.map((u) => new Request(u, { cache: 'reload' })))));
 });
 
@@ -36,24 +40,27 @@ self.addEventListener('message', (e) => {
   if (e.data === 'skipWaiting') self.skipWaiting();
 });
 
+async function networkFirst(url, cacheKey) {
+  const cache = await caches.open(CACHE);
+  // „no-cache“: beim Server nachfragen, ob es eine neue Version gibt (sonst 304, sehr schnell)
+  const fromNetwork = fetch(url, { cache: 'no-cache', credentials: 'same-origin' }).then((res) => {
+    if (res.ok) cache.put(cacheKey, res.clone());
+    return res;
+  });
+  const cached = await cache.match(cacheKey, { ignoreSearch: true });
+  if (!cached) return fromNetwork; // nichts im Speicher: auf das Netz warten
+  const offline = fromNetwork.catch(() => cached);
+  const slow = new Promise((resolve) => setTimeout(() => resolve(cached), NETWORK_TIMEOUT));
+  return Promise.race([offline, slow]);
+}
+
 self.addEventListener('fetch', (e) => {
   const req = e.request;
-  if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
+  const url = new URL(req.url);
+  if (req.method !== 'GET' || url.origin !== location.origin) return;
   if (req.mode === 'navigate') {
-    e.respondWith(caches.match('./index.html').then((r) => r || fetch(req)));
+    e.respondWith(networkFirst(url.href, './index.html'));
     return;
   }
-  e.respondWith(
-    caches.match(req, { ignoreSearch: true }).then(
-      (r) =>
-        r ||
-        fetch(req).then((res) => {
-          if (res.ok) {
-            const copy = res.clone();
-            caches.open(CACHE).then((c) => c.put(req, copy));
-          }
-          return res;
-        }),
-    ),
-  );
+  e.respondWith(networkFirst(url.href, url.href));
 });
