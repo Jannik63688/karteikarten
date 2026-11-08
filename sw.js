@@ -1,6 +1,6 @@
 // Service Worker: macht die App offline nutzbar.
 // Bei jeder Änderung an den Dateien VERSION erhöhen.
-const VERSION = 'v1.0.0';
+const VERSION = 'v1.1.0';
 const CACHE = `karteikarten-${VERSION}`;
 const ASSETS = [
   './',
@@ -10,6 +10,7 @@ const ASSETS = [
   './js/db.js',
   './js/srs.js',
   './js/parser.js',
+  './js/score.js',
   './manifest.webmanifest',
   './icons/apple-touch-icon.png',
   './icons/icon-192.png',

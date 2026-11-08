@@ -1,8 +1,10 @@
 import * as db from './db.js';
 import { schedule, newSrs, previewLabels, dayKey, relDue, fmtDays } from './srs.js';
 import { parseCards, CLAUDE_PROMPT } from './parser.js';
+import { RATINGS, knowledge, isMastered, deckKnowledge, scoreColor, distribution, weakest, HISTORY_MAX } from './score.js';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
+const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
 /* ================= Hilfsfunktionen ================= */
 const $ = (s, el = document) => el.querySelector(s);
@@ -64,6 +66,7 @@ const I = {
   check: svg('0 0 24 24', '<path d="M5 12.5l4.5 4.5L19 7.5"/>', 2.8),
   undo: svg('0 0 24 24', '<path d="M3 8h11a6 6 0 0 1 0 12H8"/><path d="M7 4L3 8l4 4"/>', 2.4),
   edit: svg('0 0 24 24', '<path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16z"/>', 2.2),
+  chart: svg('0 0 24 24', '<path d="M5 20v-6M12 20V5M19 20v-10"/>', 2.8),
   play: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5z" fill="currentColor"/></svg>',
 };
 
@@ -230,6 +233,106 @@ function cardStatus(c, now = Date.now()) {
   if (s.due <= now) return { cls: 'due', text: 'Fällig' };
   return { cls: '', text: relDue(s.due, now) };
 }
+
+/* ================= Wissensstand-Bausteine ================= */
+function scoreBadge(c) {
+  const k = knowledge(c.history);
+  if (k === null) return '<span class="score-badge new">Neu</span>';
+  return `<span class="score-badge" style="--sc:${scoreColor(k)}">${isMastered(c.history) ? '⭐ ' : ''}${k} %</span>`;
+}
+
+function mood(k, hasHistory) {
+  if (!hasHistory) return 'Los geht’s! 🚀';
+  if (k < 30) return 'Guter Anfang 🌱';
+  if (k < 60) return 'Du wirst besser 💪';
+  if (k < 85) return 'Stark unterwegs 🚀';
+  return 'Fast alles sitzt 🏆';
+}
+
+/** Fortschrittskreis. animate=false zeigt den Endwert sofort (z. B. beim stillen Aktualisieren). */
+function ringHTML(p, size = 108, stroke = 12, animate = true) {
+  const r = (size - stroke) / 2;
+  const C = 2 * Math.PI * r;
+  const off = C * (1 - p / 100);
+  const anim = animate && !reduceMotion;
+  const c = size / 2;
+  return `<div class="ring" style="width:${size}px;height:${size}px;--ring:${scoreColor(p)}" role="img" aria-label="Wissensstand ${p} Prozent">
+    <svg viewBox="0 0 ${size} ${size}" aria-hidden="true"><circle class="ring-track" cx="${c}" cy="${c}" r="${r}" stroke-width="${stroke}"/>
+    <circle class="ring-val" cx="${c}" cy="${c}" r="${r}" stroke-width="${stroke}" stroke-dasharray="${C.toFixed(2)}"
+      stroke-dashoffset="${(anim ? C : off).toFixed(2)}" ${anim ? `data-off="${off.toFixed(2)}"` : ''} transform="rotate(-90 ${c} ${c})"/></svg>
+    <div class="ring-label" style="font-size:${Math.round(size * 0.27)}px"><b ${anim ? `data-count="${p}"` : ''}>${anim ? 0 : p}</b><span>%</span></div></div>`;
+}
+
+function animateIn(root) {
+  root.querySelectorAll('.ring-val[data-off]').forEach((c) => {
+    const off = c.dataset.off;
+    delete c.dataset.off;
+    raf2(() => { c.style.strokeDashoffset = off; });
+  });
+  root.querySelectorAll('[data-count]').forEach((el) => {
+    const to = +el.dataset.count;
+    delete el.dataset.count;
+    const t0 = performance.now();
+    const step = (now) => {
+      const k = Math.min(1, (now - t0) / 1000);
+      el.textContent = Math.round(to * (1 - Math.pow(1 - k, 3)));
+      if (k < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  });
+  root.querySelectorAll('.mini-bar span[data-w]').forEach((s) => {
+    const w = s.dataset.w;
+    delete s.dataset.w;
+    raf2(() => { s.style.width = `${w}%`; });
+  });
+}
+
+function confetti(n = 80) {
+  if (reduceMotion) return;
+  const colors = ['#FF4B4B', '#FFC800', '#1CB0F6', '#58CC02', '#CE82FF', '#FF9600'];
+  const wrap = h('<div class="confetti" aria-hidden="true"></div>');
+  for (let i = 0; i < n; i++) {
+    const p = document.createElement('i');
+    p.style.left = `${Math.random() * 100}%`;
+    p.style.background = colors[i % colors.length];
+    p.style.setProperty('--dx', `${Math.round(Math.random() * 200 - 100)}px`);
+    p.style.setProperty('--rot', `${Math.round(Math.random() * 900 - 450)}deg`);
+    p.style.animationDelay = `${(Math.random() * 0.35).toFixed(2)}s`;
+    p.style.animationDuration = `${(1.8 + Math.random() * 1.4).toFixed(2)}s`;
+    if (i % 3 === 0) p.style.borderRadius = '50%';
+    wrap.appendChild(p);
+  }
+  document.body.appendChild(wrap);
+  setTimeout(() => wrap.remove(), 4000);
+}
+
+/** Letzte 7 Lerntage mit Anzahl Antworten aus den Verläufen. */
+function last7Days(cards) {
+  const keys = [];
+  const [y, m, d] = dayKey().split('-').map(Number);
+  for (let i = 6; i >= 0; i--) {
+    const dt = new Date(y, m - 1, d - i, 12);
+    keys.push({
+      key: `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`,
+      short: i === 0 ? 'Heute' : dt.toLocaleDateString('de-DE', { weekday: 'short' }).replace('.', ''),
+      long: dt.toLocaleDateString('de-DE', { weekday: 'long', day: 'numeric', month: 'long' }),
+      n: 0,
+    });
+  }
+  const idx = new Map(keys.map((k, i) => [k.key, i]));
+  for (const c of cards) for (const e of c.history || []) {
+    const i = idx.get(dayKey(e.t));
+    if (i !== undefined) keys[i].n++;
+  }
+  return keys;
+}
+
+const fmtDateTime = (ts) => {
+  const d = new Date(ts);
+  const today = dayKey() === dayKey(ts);
+  const time = d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+  return today ? `heute, ${time}` : `${d.toLocaleDateString('de-DE', { day: 'numeric', month: 'short' })}, ${time}`;
+};
 
 function buildQueue(deckIds) {
   const now = Date.now();
@@ -431,9 +534,9 @@ function actionSheet({ title = '', message = '', actions }) {
   });
 }
 
-function openSheet({ title, left = 'Abbrechen', right = null, onRight, onClose }) {
+function openSheet({ title, left = 'Abbrechen', right = null, onRight, onClose, compact = false }) {
   const backdrop = h('<div class="sheet-backdrop"></div>');
-  const el = h(`<div class="sheet" role="dialog" aria-label="${esc(title)}">
+  const el = h(`<div class="sheet ${compact ? 'compact' : ''}" role="dialog" aria-label="${esc(title)}">
     <div class="sheet-header"><button class="nav-btn sh-left">${esc(left)}</button><div class="sheet-title">${esc(title)}</div>
     ${right ? `<button class="nav-btn strong sh-right">${esc(right)}</button>` : '<span></span>'}<div class="sheet-grabber"></div></div>
     <div class="sheet-body"></div></div>`);
@@ -647,7 +750,9 @@ function refresh() {
 function HomeView() {
   const v = makeView({ title: 'Karteikarten' });
   v.left.innerHTML = `<button class="nav-btn icon" data-a="settings" aria-label="Einstellungen">${I.gear}</button>`;
-  v.right.innerHTML = `<button class="nav-btn icon" data-a="add-deck" aria-label="Neuer Stapel">${I.plus}</button>`;
+  v.right.innerHTML = `<button class="nav-btn icon" data-a="stats" aria-label="Statistik">${I.chart}</button>
+    <button class="nav-btn icon" data-a="add-deck" aria-label="Neuer Stapel">${I.plus}</button>`;
+  const shown = new Map(); // zuletzt angezeigte Werte, damit nur Änderungen animiert werden
 
   v.render = () => {
     const now = Date.now();
@@ -659,14 +764,21 @@ function HomeView() {
         review += c.review;
         learn += c.learn;
         nw += c.newAvail;
-        const sub = c.total ? `${plural(c.total, 'Karte', 'Karten')}${c.due ? '' : ' · erledigt ✓'}` : 'Noch leer';
+        const k = deckKnowledge(deckCards(d.id));
+        const animate = shown.get(d.id) !== k;
+        shown.set(d.id, k);
+        const sub = c.total ? `${plural(c.total, 'Karte', 'Karten')} · ${k} % gewusst${c.due ? '' : ' ✓'}` : 'Noch leer';
         return `<button class="row" data-a="open-deck" data-id="${d.id}">
           <span class="tile big" style="background:${esc(d.color)}">${esc(d.emoji)}</span>
-          <span class="row-main"><span class="row-title">${esc(d.name)}</span><span class="row-sub">${sub}</span></span>
+          <span class="row-main"><span class="row-title">${esc(d.name)}</span><span class="row-sub">${sub}</span>
+            ${c.total ? `<span class="mini-bar"><span style="width:${animate && !reduceMotion ? 0 : k}%;background:${scoreColor(k)}" ${animate && !reduceMotion ? `data-w="${k}"` : ''}></span></span>` : ''}</span>
           ${c.due ? `<span class="badge" style="background:${esc(d.color)}">${c.due}</span>` : ''}
           <span class="chev">${I.chev}</span></button>`;
       })
       .join('');
+    const overall = deckKnowledge(S.cards);
+    const mastered = S.cards.filter((c) => isMastered(c.history)).length;
+    const answers = S.cards.reduce((n, c) => n + (c.history?.length || 0), 0);
     const today = S.stats.days[dayKey(now)] || 0;
     const st = streak();
     const parts = [review && `${review} Wiederholen`, learn && `${learn} Lernen`, nw && `${nw} Neu`].filter(Boolean).join(' · ');
@@ -678,10 +790,15 @@ function HomeView() {
         <div class="hero-top">
           <div><div class="hero-label">Heute fällig</div><div class="hero-num">${due}</div>
           <div class="hero-sub">${due ? parts : 'Alles erledigt – stark! 🎉'}</div></div>
-          <div class="hero-chips"><div class="chip">🔥 ${st ? plural(st, 'Tag', 'Tage') : 'Serie starten'}</div><div class="chip">✓ ${today} heute</div></div>
+          <div class="hero-chips"><div class="chip ${st ? 'fire' : ''}">🔥 ${st ? plural(st, 'Tag', 'Tage') : 'Serie starten'}</div><div class="chip">✅ ${today} heute</div></div>
         </div>
         ${due ? `<button class="btn white" data-a="learn-all">${I.play}Jetzt lernen</button>`
-          : S.cards.length ? `<button class="btn white" data-a="cram-all">Frei üben</button>` : ''}
+          : S.cards.length ? `<button class="btn white" data-a="cram-all">🔁 Frei üben</button>` : ''}
+      </div>
+      <div class="tiles3">
+        <button class="stat-tile" data-a="stats"><span class="st-emoji">🧠</span><span class="st-num">${overall} %</span><span class="st-label">Wissensstand</span></button>
+        <button class="stat-tile" data-a="stats"><span class="st-emoji">⭐</span><span class="st-num">${mastered}</span><span class="st-label">gemeistert</span></button>
+        <button class="stat-tile" data-a="stats"><span class="st-emoji">🎯</span><span class="st-num">${answers}</span><span class="st-label">Antworten</span></button>
       </div>
       ${needBackup ? `<div class="section"><div class="group has-tiles"><button class="row" data-a="backup">
         <span class="tile" style="background:var(--green)">${I.share}</span>
@@ -700,6 +817,7 @@ function HomeView() {
             <span class="row-main"><span class="row-title">Prompt für Claude kopieren</span></span></button>
         </div>
         <div class="section-footer">Lass dir von Claude Karten erstellen, kopiere die Antwort und füge sie hier ein.</div></div>`;
+    animateIn(v.content);
   };
 
   v.el.addEventListener('click', (e) => {
@@ -708,10 +826,11 @@ function HomeView() {
     const all = () => S.decks.map((d) => d.id);
     switch (a.dataset.a) {
       case 'settings': pushView(SettingsView()); break;
+      case 'stats': pushView(StatsView()); break;
       case 'add-deck': openDeckEditor(); break;
       case 'open-deck': pushView(DeckView(a.dataset.id)); break;
       case 'learn-all': startLearn({ deckIds: all() }); break;
-      case 'cram-all': startLearn({ deckIds: all(), cram: true }); break;
+      case 'cram-all': startLearn({ deckIds: all(), practice: true }); break;
       case 'import': openImport(); break;
       case 'copy-prompt': copyPrompt(); break;
       case 'backup': createBackup(); break;
@@ -727,44 +846,56 @@ function DeckView(deckId) {
   v.right.innerHTML = `<button class="nav-btn icon" data-a="more" aria-label="Optionen">${I.more}</button>
     <button class="nav-btn icon" data-a="add-card" aria-label="Neue Karte">${I.plus}</button>`;
   v.content.innerHTML = `<div class="deck-head"></div><div class="deck-top"></div>
-    <div class="search">${I.search}<input type="search" placeholder="Karten durchsuchen" enterkeyhint="search" autocomplete="off"></div>
+    <div class="list-tools">
+      <div class="search">${I.search}<input type="search" placeholder="Karten durchsuchen" enterkeyhint="search" autocomplete="off"></div>
+      <div class="seg sort-seg" role="tablist" aria-label="Sortierung">
+        <button data-sort="new" role="tab">Neueste</button><button data-sort="weak" role="tab">Schwächste zuerst</button><button data-sort="az" role="tab">A–Z</button></div>
+    </div>
     <div class="deck-list"></div>`;
   const headEl = $('.deck-head', v.content);
   const topEl = $('.deck-top', v.content);
-  const searchEl = $('.search', v.content);
-  const input = $('input', searchEl);
+  const toolsEl = $('.list-tools', v.content);
+  const input = $('input', toolsEl);
   const listEl = $('.deck-list', v.content);
+  let lastK = null;
   input.addEventListener('input', () => renderList());
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') input.blur(); });
 
+  const sorters = {
+    new: (a, b) => b.created - a.created,
+    weak: (a, b) => (knowledge(a.history) ?? 101) - (knowledge(b.history) ?? 101) || b.created - a.created,
+    az: (a, b) => plain(a.front).localeCompare(plain(b.front), 'de', { sensitivity: 'base' }),
+  };
+
   function renderList() {
+    const sort = sorters[S.settings.cardSort] ? S.settings.cardSort : 'new';
+    toolsEl.querySelectorAll('[data-sort]').forEach((b) => {
+      b.classList.toggle('on', b.dataset.sort === sort);
+      b.setAttribute('aria-selected', b.dataset.sort === sort);
+    });
     const q = norm(input.value);
-    const all = deckCards(deckId).sort((a, b) => b.created - a.created);
+    const all = deckCards(deckId).sort(sorters[sort]);
     if (!all.length) {
-      searchEl.classList.add('hidden');
+      toolsEl.classList.add('hidden');
       listEl.innerHTML = `<div class="empty"><div class="empty-icon">🗂️</div><h3>Noch keine Karten</h3>
         <p>Lege deine erste Karte an oder importiere mehrere auf einmal aus Text.</p>
         <button class="btn primary" data-a="add-card">${I.plus}Karte anlegen</button>
         <button class="btn secondary" data-a="import">Aus Text importieren</button></div>`;
       return;
     }
-    searchEl.classList.remove('hidden');
+    toolsEl.classList.remove('hidden');
     const list = q ? all.filter((c) => norm(c.front).includes(q) || norm(c.back).includes(q)) : all;
     if (!list.length) {
-      listEl.innerHTML = '<div class="empty"><p>Keine Treffer.</p></div>';
+      listEl.innerHTML = '<div class="empty"><p>Keine Treffer. 🔍</p></div>';
       return;
     }
-    const now = Date.now();
     const shown = list.slice(0, 400);
     listEl.innerHTML = `<div class="section"><div class="section-header">${plural(list.length, 'Karte', 'Karten')}</div>
       <div class="group">${shown
-        .map((c) => {
-          const st = cardStatus(c, now);
-          return `<button class="row" data-a="edit-card" data-id="${c.id}">
+        .map((c) => `<button class="row" data-a="card-detail" data-id="${c.id}">
             <span class="row-main"><span class="row-title">${esc(plain(c.front))}</span><span class="row-sub">${esc(plain(c.back))}</span></span>
             ${c.imageId ? `<span class="photo-ind">${I.photo}</span>` : ''}
-            <span class="status ${st.cls}">${esc(st.text)}</span></button>`;
-        })
+            ${scoreBadge(c)}</button>`)
         .join('')}</div>
       ${list.length > shown.length ? `<div class="section-footer">… und ${list.length - shown.length} weitere. Nutze die Suche.</div>` : ''}</div>`;
   }
@@ -774,45 +905,76 @@ function DeckView(deckId) {
     if (!d) return;
     v.setTitle(d.name);
     const c = deckCounts(deckId);
+    const cards = deckCards(deckId);
+    const k = deckKnowledge(cards);
+    const animate = lastK !== k;
+    lastK = k;
+    const mastered = cards.filter((x) => isMastered(x.history)).length;
+    const learned = cards.filter((x) => x.history?.length).length;
+    const weakN = weakest(cards).length;
     headEl.innerHTML = `<span class="tile big" style="background:${esc(d.color)}">${esc(d.emoji)}</span><h1 class="large-title">${esc(d.name)}</h1>`;
     topEl.innerHTML = c.total
-      ? `<div class="stats3">
+      ? `<button class="deck-card" data-a="stats" aria-label="Statistik öffnen">
+          ${ringHTML(k, 112, 13, animate)}
+          <span class="deck-card-info">
+            <span class="dc-label">Wissensstand</span>
+            <span class="dc-mood">${mood(k, learned > 0)}</span>
+            <span class="dc-chips"><span class="mini-chip">⭐ ${mastered} gemeistert</span><span class="mini-chip">📚 ${learned}/${c.total} gelernt</span></span>
+          </span><span class="chev">${I.chev}</span></button>
+        <div class="stats3">
           <div class="stat c-new"><div class="stat-num">${c.newAvail}</div><div class="stat-label">Neu</div></div>
           <div class="stat c-learn"><div class="stat-num">${c.learn}</div><div class="stat-label">Lernen</div></div>
           <div class="stat c-due"><div class="stat-num">${c.review}</div><div class="stat-label">Wiederholen</div></div></div>
         <div class="deck-actions">${c.due
-          ? `<button class="btn primary" data-a="learn">${I.play}Lernen</button>`
-          : `<button class="btn secondary" data-a="cram">Frei üben</button>
-             <div class="deck-note">Für heute alles erledigt 🎉${c.nextDue < Infinity ? ` Nächste Karte ${relDue(c.nextDue)}.` : ''}</div>`}</div>`
+          ? `<button class="btn primary" data-a="learn">${I.play}Lernen · ${c.due}</button>`
+          : `<div class="all-done">🎉 Für heute alles erledigt!${c.nextDue < Infinity ? `<br><span>Nächste Karte ${relDue(c.nextDue).replace(/\.$/, '')}.</span>` : ''}</div>`}
+          <div class="btn-row">
+            ${weakN ? `<button class="btn secondary sm" data-a="weak">🎯 Schwächste üben</button>` : ''}
+            <button class="btn secondary sm" data-a="cram">🔁 Frei üben</button></div></div>`
       : '';
     renderList();
+    animateIn(topEl);
   };
 
   v.el.addEventListener('click', async (e) => {
+    const sortBtn = e.target.closest('[data-sort]');
+    if (sortBtn) {
+      S.settings.cardSort = sortBtn.dataset.sort;
+      saveSettings();
+      renderList();
+      return;
+    }
     const a = e.target.closest('[data-a]');
     if (!a) return;
     const d = getDeck(deckId);
     if (!d) return;
     switch (a.dataset.a) {
       case 'learn': startLearn({ deckIds: [deckId] }); break;
-      case 'cram': startLearn({ deckIds: [deckId], cram: true }); break;
+      case 'cram': startLearn({ deckIds: [deckId], practice: true }); break;
+      case 'weak': {
+        const ids = weakest(deckCards(deckId)).map((w) => w.card.id);
+        startLearn({ cardIds: ids, practice: true });
+        break;
+      }
+      case 'stats': pushView(StatsView(deckId)); break;
       case 'add-card': openCardEditor({ deckId }); break;
       case 'import': openImport({ deckId }); break;
-      case 'edit-card': openCardEditor({ card: getCard(a.dataset.id) }); break;
+      case 'card-detail': openCardDetail(a.dataset.id); break;
       case 'more': {
         const has = deckCards(deckId).length > 0;
         const choice = await actionSheet({
           title: `${d.emoji} ${d.name}`,
           actions: [
             { text: 'Stapel bearbeiten', value: 'edit' },
-            ...(has ? [{ text: 'Frei üben (alle Karten)', value: 'cram' }, { text: 'Als Text kopieren', value: 'copy' }] : []),
+            ...(has ? [{ text: 'Statistik', value: 'stats' }, { text: 'Frei üben (alle Karten)', value: 'cram' }, { text: 'Als Text kopieren', value: 'copy' }] : []),
             { text: 'Karten aus Text importieren', value: 'import' },
             ...(has ? [{ text: 'Lernfortschritt zurücksetzen', value: 'reset' }] : []),
             { text: 'Stapel löschen', value: 'delete', destructive: true },
           ],
         });
         if (choice === 'edit') openDeckEditor(d);
-        else if (choice === 'cram') startLearn({ deckIds: [deckId], cram: true });
+        else if (choice === 'stats') pushView(StatsView(deckId));
+        else if (choice === 'cram') startLearn({ deckIds: [deckId], practice: true });
         else if (choice === 'import') openImport({ deckId });
         else if (choice === 'copy') {
           const lines = deckCards(deckId)
@@ -821,8 +983,8 @@ function DeckView(deckId) {
           const ok = await copyText(`# ${d.name}\n${lines.join('\n')}`);
           toast(ok ? `${plural(lines.length, 'Karte', 'Karten')} kopiert` : 'Kopieren nicht möglich');
         } else if (choice === 'reset') {
-          if (await confirmBox('Fortschritt zurücksetzen?', `Alle Karten in „${d.name}“ gelten danach wieder als neu.`, 'Zurücksetzen')) {
-            const cs = deckCards(deckId).map((c) => ({ ...c, srs: newSrs(), updated: Date.now() }));
+          if (await confirmBox('Fortschritt zurücksetzen?', `Alle Karten in „${d.name}“ gelten danach wieder als neu, Lernplan und Bewertungsverlauf werden gelöscht.`, 'Zurücksetzen')) {
+            const cs = deckCards(deckId).map((c) => ({ ...c, srs: newSrs(), history: [], updated: Date.now() }));
             cs.forEach(upsertLocal);
             await db.bulk(cs.map((c) => ({ store: 'cards', op: 'put', value: c })));
             refresh();
@@ -1008,9 +1170,9 @@ function openCardEditor({ card = null, deckId = null, onSaved, onDeleted } = {})
         break;
       case 'save-next': save(true); break;
       case 'reset': {
-        if (!(await confirmBox('Fortschritt zurücksetzen?', 'Die Karte gilt danach wieder als neu.', 'Zurücksetzen'))) return;
+        if (!(await confirmBox('Fortschritt zurücksetzen?', 'Die Karte gilt danach wieder als neu, ihr Bewertungsverlauf wird gelöscht.', 'Zurücksetzen'))) return;
         const c = getCard(card.id);
-        if (c) await saveCard({ ...c, srs: newSrs() });
+        if (c) await saveCard({ ...c, srs: newSrs(), history: [] });
         sh.close();
         refresh();
         onSaved?.(getCard(card.id));
@@ -1086,10 +1248,18 @@ function openCardEditor({ card = null, deckId = null, onSaved, onDeleted } = {})
 /* ================= Lernmodus ================= */
 let learnOpen = false;
 
-function startLearn({ deckIds, cram = false }) {
-  let queue = cram ? shuffle(S.cards.filter((c) => deckIds.includes(c.deckId))).map((c) => c.id) : buildQueue(deckIds);
+/**
+ * deckIds: Stapel lernen (Lernplan) · practice: frei üben ohne Lernplan-Änderung
+ * cardIds: genau diese Karten üben (z. B. „Diese Begriffe musst du üben“)
+ * Jede Bewertung landet im Verlauf der Karte und zählt für den Wissensstand.
+ */
+function startLearn({ deckIds = [], cardIds = null, practice = false }) {
+  let queue;
+  if (cardIds) queue = cardIds.filter((id) => getCard(id));
+  else if (practice) queue = shuffle(S.cards.filter((c) => deckIds.includes(c.deckId))).map((c) => c.id);
+  else queue = buildQueue(deckIds);
   if (!queue.length) {
-    toast(cram ? 'Keine Karten vorhanden' : 'Gerade ist nichts fällig');
+    toast(practice ? 'Keine Karten vorhanden' : 'Gerade ist nichts fällig 🎉');
     return;
   }
   learnOpen = true;
@@ -1117,17 +1287,25 @@ function startLearn({ deckIds, cram = false }) {
   let flipped = false;
   let busy = false;
   let done = 0;
+  let combo = 0;
+  let bestCombo = 0;
   const tally = { 1: 0, 2: 0, 3: 0, 4: 0 };
   const seen = new Set();
+  const startScores = new Map();
+  const retried = new Set();
   const history = [];
 
   const imgTag = (c, small) => (c.imageId ? `<img class="fc-img ${small ? 'small' : ''}" data-img="${c.imageId}" alt="">` : '');
   const frontHTML = (c) => {
-    const st = cardStatus(c);
-    const tag = cram ? '' : `<span class="fc-tag ${st.cls}">${c.srs.state === 'new' ? 'Neu' : c.srs.state === 'review' ? 'Wiederholung' : 'Lernen'}</span>`;
+    const k = knowledge(c.history);
+    const tag = k === null
+      ? '<span class="fc-tag new">🆕 Neu</span>'
+      : isMastered(c.history)
+        ? `<span class="fc-tag star">⭐ ${k} %</span>`
+        : `<span class="fc-tag" style="--sc:${scoreColor(k)}">${k} %</span>`;
     return `${tag}<div class="fc-inner">${c.imageSide === 'front' ? imgTag(c) : ''}
       <div class="fc-term ${c.front.length > 60 ? 'long' : ''}">${rich(c.front)}</div></div>
-      <div class="fc-hint">Tippen zum Umdrehen</div>`;
+      <div class="fc-hint">👆 Tippen zum Umdrehen</div>`;
   };
   const backHTML = (c) => {
     const long = c.back.length > 140 || c.back.includes('\n');
@@ -1137,26 +1315,24 @@ function startLearn({ deckIds, cram = false }) {
       ${c.back ? `<div class="fc-answer ${long ? 'long' : ''}">${rich(c.back)}</div>` : ''}</div>`;
   };
 
+  const sessionSize = new Set(queue).size;
   function progress() {
     const rem = queue.length + (current ? 1 : 0);
-    const total = done + rem;
-    bar.style.width = `${total ? (done / total) * 100 : 100}%`;
+    // Erledigte Karten zählen voll, schon einmal beantwortete halb – so wächst der Balken mit jeder Antwort.
+    const part = rem ? (done + 0.5 * Math.max(0, seen.size - done)) / Math.max(1, sessionSize) : 1;
+    bar.style.width = `${Math.max(4, Math.min(100, part * 100))}%`;
     countEl.textContent = rem || '';
   }
 
   function renderBottom() {
     if (!current) {
-      bottom.innerHTML = '<button class="btn primary show" data-a="close">Fertig</button>';
+      bottom.innerHTML = '<button class="btn primary show" data-a="close">Weiter</button>';
     } else if (!flipped) {
       bottom.innerHTML = '<button class="btn primary show" data-a="flip">Antwort zeigen</button>';
-    } else if (cram) {
-      bottom.innerHTML = `<div class="rate-grid two"><button class="rate r1" data-r="1">Nochmal<small>kommt gleich wieder</small></button>
-        <button class="rate r3" data-r="3">Gewusst<small>weiter</small></button></div>`;
     } else {
-      const l = previewLabels(current.srs);
-      const names = ['Nochmal', 'Schwer', 'Gut', 'Einfach'];
-      bottom.innerHTML = `<div class="rate-grid">${names
-        .map((n, i) => `<button class="rate r${i + 1}" data-r="${i + 1}">${n}<small>${l[i]}</small></button>`)
+      const l = practice ? ['gleich nochmal', 'später nochmal', 'weiter', 'weiter'] : previewLabels(current.srs);
+      bottom.innerHTML = `<div class="rate-grid">${[1, 2, 3, 4]
+        .map((r) => `<button class="rate r${r}" data-r="${r}"><span>${RATINGS[r].name}</span><small>${l[r - 1]}</small></button>`)
         .join('')}</div>`;
     }
   }
@@ -1210,36 +1386,61 @@ function startLearn({ deckIds, cram = false }) {
     finish();
   }
 
+  function cheer(text, cls = '') {
+    el.querySelectorAll('.combo').forEach((x) => x.remove());
+    const c = h(`<div class="combo ${cls}" role="status">${esc(text)}</div>`);
+    el.appendChild(c);
+    setTimeout(() => c.remove(), 1700);
+  }
+
   async function rate(r) {
     if (!flipped || busy || !current) return;
     busy = true;
     const card = current;
-    history.push({ card: JSON.parse(JSON.stringify(card)), queue: queue.slice(), done, tally: { ...tally }, seen: [...seen] });
+    history.push({ card: JSON.parse(JSON.stringify(card)), queue: queue.slice(), done, combo, tally: { ...tally }, seen: [...seen], retried: [...retried] });
     undoBtn.disabled = false;
+    if (!startScores.has(card.id)) startScores.set(card.id, knowledge(card.history) ?? 0);
     seen.add(card.id);
     tally[r]++;
-    if (cram) {
-      if (r === 1) queue.splice(Math.min(3, queue.length), 0, card.id);
-      else done++;
-    } else {
-      const s = schedule(card.srs, r);
-      try {
-        await saveCard({ ...card, srs: s });
-        bumpStats(1);
-      } catch (err) {
-        busy = false;
-        alertBox({ title: 'Speichern fehlgeschlagen', message: err?.message || String(err) });
-        return;
-      }
-      if (s.state !== 'review') {
-        const pos = r === 1 ? 3 : r === 2 ? 5 : 8;
-        queue.splice(Math.min(pos, queue.length), 0, card.id);
-      } else done++;
+    const wasMastered = isMastered(card.history);
+    const hist = [...(card.history || []), { t: Date.now(), r }].slice(-HISTORY_MAX);
+    const updated = practice ? { ...card, history: hist } : { ...card, history: hist, srs: schedule(card.srs, r) };
+    try {
+      await saveCard(updated);
+      bumpStats(1);
+    } catch (err) {
+      history.pop();
+      busy = false;
+      alertBox({ title: 'Speichern fehlgeschlagen', message: err?.message || String(err) });
+      return;
     }
+    if (practice) {
+      if (r === 1) queue.splice(Math.min(3, queue.length), 0, card.id);
+      else if (r === 2 && !retried.has(card.id)) {
+        retried.add(card.id);
+        queue.push(card.id);
+      } else done++;
+    } else if (updated.srs.state !== 'review') {
+      queue.splice(Math.min(r === 1 ? 3 : r === 2 ? 5 : 8, queue.length), 0, card.id);
+    } else done++;
+
+    // Erfolgsmomente
+    combo = r === 1 ? 0 : combo + 1;
+    bestCombo = Math.max(bestCombo, combo);
+    if (!wasMastered && isMastered(hist)) cheer('⭐ Gemeistert!', 'star');
+    else if (combo >= 3 && combo % 5 === 0) cheer(`🔥 ${combo} in Folge!`);
+    else if (r === 4 && Math.random() < 0.35) cheer(['😎 Easy!', '💪 Stark!', '🚀 Weiter so!'][Math.floor(Math.random() * 3)], 'small');
+
     const cardEl = $('.flashcard', stage);
-    if (cardEl) {
+    if (cardEl && !reduceMotion) {
+      if (r === 1) {
+        await cardEl.animate(
+          [{ transform: 'translateX(0)' }, { transform: 'translateX(-12px)' }, { transform: 'translateX(10px)' }, { transform: 'translateX(-6px)' }, { transform: 'translateX(0)' }],
+          { duration: 280, easing: 'ease-out' },
+        ).finished.catch(() => {});
+      }
       await cardEl
-        .animate([{ transform: 'none', opacity: 1 }, { transform: 'translateX(-28px) scale(.98)', opacity: 0 }], { duration: 150, easing: 'ease-in', fill: 'forwards' })
+        .animate([{ transform: 'none', opacity: 1 }, { transform: r === 1 ? 'translateY(16px) scale(.97)' : 'translateX(-30px) rotate(-2deg) scale(.98)', opacity: 0 }], { duration: 160, easing: 'ease-in', fill: 'forwards' })
         .finished.catch(() => {});
     }
     next();
@@ -1250,15 +1451,17 @@ function startLearn({ deckIds, cram = false }) {
     if (busy || !history.length) return;
     busy = true;
     const snap = history.pop();
-    if (!cram) {
-      await saveCard(snap.card);
-      bumpStats(-1);
-    }
+    await saveCard(snap.card);
+    bumpStats(-1);
     queue = snap.queue;
     done = snap.done;
+    combo = snap.combo;
     Object.assign(tally, snap.tally);
     seen.clear();
     snap.seen.forEach((id) => seen.add(id));
+    retried.clear();
+    snap.retried.forEach((id) => retried.add(id));
+    if (!seen.has(snap.card.id)) startScores.delete(snap.card.id);
     current = getCard(snap.card.id);
     if (current) showCard();
     else next();
@@ -1271,14 +1474,29 @@ function startLearn({ deckIds, cram = false }) {
     editBtn.disabled = true;
     deckEl.textContent = '';
     const n = seen.size;
-    stage.innerHTML = `<div class="done"><div class="done-check">${I.check}</div><h2>Geschafft!</h2>
-      <p>${cram ? `Du hast ${plural(n, 'Karte', 'Karten')} geübt.` : `Du hast ${plural(n, 'Karte', 'Karten')} gelernt.`}</p>
-      ${cram ? '' : `<div class="done-stats">
-        <div><b style="color:var(--red)">${tally[1]}</b><span>Nochmal</span></div>
-        <div><b style="color:var(--orange)">${tally[2]}</b><span>Schwer</span></div>
-        <div><b style="color:var(--green)">${tally[3]}</b><span>Gut</span></div>
-        <div><b style="color:var(--blue)">${tally[4]}</b><span>Einfach</span></div></div>`}</div>`;
+    const answers = tally[1] + tally[2] + tally[3] + tally[4];
+    const pct = answers ? Math.round((100 * (tally[2] + tally[3] + tally[4])) / answers) : 0;
+    let delta = 0;
+    if (startScores.size) {
+      let diff = 0;
+      for (const [id, before] of startScores) diff += (knowledge(getCard(id)?.history) ?? before) - before;
+      delta = Math.round(diff / startScores.size);
+    }
+    const headline = pct >= 90 ? 'Perfekt! 🏆' : pct >= 70 ? 'Super gemacht!' : pct >= 40 ? 'Gut dabei! 💪' : 'Dranbleiben! 🌱';
+    const st = streak();
+    stage.innerHTML = `<div class="done">
+      <div class="done-emoji">🎉</div>
+      <h2>${headline}</h2>
+      <p>Du hast ${plural(n, 'Karte', 'Karten')} ${practice ? 'geübt' : 'gelernt'}${bestCombo >= 5 ? ` · beste Serie: ${bestCombo} 🔥` : ''}.</p>
+      <div class="done-hero">
+        <div class="dh"><b>${pct} %</b><span>gewusst</span></div>
+        <div class="dh"><b class="${delta > 0 ? 'up' : ''}">${delta > 0 ? '+' : ''}${delta} %</b><span>Wissensstand</span></div>
+        <div class="dh"><b>🔥 ${st}</b><span>${st === 1 ? 'Tag' : 'Tage'} Serie</span></div>
+      </div>
+      <div class="done-stats">${[1, 2, 3, 4].map((r) => `<div class="ds r${r}"><i></i><b>${tally[r]}</b><span>${RATINGS[r].name}</span></div>`).join('')}</div>
+    </div>`;
     renderBottom();
+    if (answers) confetti();
   }
 
   function close() {
@@ -1311,11 +1529,8 @@ function startLearn({ deckIds, cram = false }) {
       e.preventDefault();
       if (!current) close();
       else if (!flipped) flip();
-      else if (cram) rate(3);
-    } else if (/^[1-4]$/.test(e.key) && flipped) {
-      if (!cram) rate(+e.key);
-      else if (e.key === '1' || e.key === '3') rate(+e.key);
-    } else if (e.key === 'Escape') close();
+    } else if (/^[1-4]$/.test(e.key) && flipped) rate(+e.key);
+    else if (e.key === 'Escape') close();
   }
   document.addEventListener('keydown', onKey);
 
@@ -1637,6 +1852,174 @@ async function restoreFromFile(file) {
   toast(replace ? 'Backup wiederhergestellt' : `${plural(added, 'Karte', 'Karten')} übernommen`);
 }
 
+/* ================= Statistik ================= */
+function StatsView(deckId = null) {
+  const deck0 = deckId ? getDeck(deckId) : null;
+  const v = makeView({ title: 'Statistik', backLabel: deck0 ? deck0.name : 'Karteikarten' });
+  let lastK = null;
+  let selDay = 6;
+
+  v.render = () => {
+    const d = deckId ? getDeck(deckId) : null;
+    if (deckId && !d) return;
+    const cards = d ? deckCards(deckId) : S.cards;
+    const k = deckKnowledge(cards);
+    const animate = lastK !== k;
+    lastK = k;
+    const learned = cards.filter((c) => c.history?.length).length;
+    const mastered = cards.filter((c) => isMastered(c.history)).length;
+    const dist = distribution(cards);
+    const total = dist[1] + dist[2] + dist[3] + dist[4];
+    const weak = weakest(cards, 12);
+    const days = last7Days(cards);
+    const maxN = Math.max(1, ...days.map((x) => x.n));
+    const st = streak();
+    const pct = (n) => (total ? Math.round((100 * n) / total) : 0);
+
+    v.content.innerHTML = `
+      <div class="scope-line">${d ? `${esc(d.emoji)} ${esc(d.name)}` : '📚 Alle Stapel'}</div>
+      <div class="stats-hero">
+        ${ringHTML(k, 132, 15, animate)}
+        <div class="sh-info">
+          <div class="dc-label">Wissensstand</div>
+          <div class="dc-mood">${mood(k, learned > 0)}</div>
+          <div class="sh-grid">
+            <div><b>⭐ ${mastered}</b><span>gemeistert</span></div>
+            <div><b>📚 ${learned}/${cards.length}</b><span>gelernt</span></div>
+            <div><b>🔥 ${st}</b><span>${st === 1 ? 'Tag' : 'Tage'} Serie</span></div>
+            <div><b>🎯 ${total}</b><span>Antworten</span></div>
+          </div>
+        </div>
+      </div>
+
+      ${total ? `
+      <div class="section"><div class="section-header">Letzte 7 Tage</div>
+        <div class="chart-card">
+          <div class="chart-caption" aria-live="polite"></div>
+          <div class="bars" role="group" aria-label="Antworten pro Tag">
+            ${days.map((x, i) => `<button class="bar-col ${i === selDay ? 'sel' : ''}" data-day="${i}" aria-label="${esc(x.long)}: ${x.n} Antworten">
+              <span class="vbar ${i === 6 ? 'today' : ''}" style="height:${x.n ? Math.max(6, (x.n / maxN) * 100) : 0}%"></span>
+              <span class="bar-day">${esc(x.short)}</span></button>`).join('')}
+          </div>
+        </div></div>
+
+      <div class="section"><div class="section-header">Deine Antworten</div>
+        <div class="chart-card">
+          <div class="stack" role="img" aria-label="${[1, 2, 3, 4].map((r) => `${RATINGS[r].name} ${dist[r]}`).join(', ')}">
+            ${[1, 2, 3, 4].filter((r) => dist[r]).map((r) => `<span class="seg-r r${r}" style="flex-grow:${dist[r]}"></span>`).join('')}
+          </div>
+          <div class="legend4">
+            ${[1, 2, 3, 4].map((r) => `<div class="lg"><i class="r${r}"></i><span class="lg-name">${RATINGS[r].emoji} ${RATINGS[r].name}</span>
+              <span class="lg-val"><b>${dist[r]}</b> · ${pct(dist[r])} %</span></div>`).join('')}
+          </div>
+        </div></div>
+
+      <div class="section"><div class="section-header">💪 Diese Begriffe musst du üben</div>
+        ${weak.length ? `<div class="group">${weak.map((w) => {
+          const dk = getDeck(w.card.deckId);
+          return `<button class="row" data-a="card-detail" data-id="${w.card.id}">
+            <span class="row-main"><span class="row-title">${esc(plain(w.card.front))}</span>
+            <span class="row-sub">${d ? esc(plain(w.card.back)) : `${esc(dk?.emoji || '')} ${esc(dk?.name || '')}`}</span></span>
+            ${scoreBadge(w.card)}</button>`;
+        }).join('')}</div>
+        <div class="pad" style="margin-top:14px"><button class="btn primary" data-a="practice-weak">🎯 ${plural(weak.length, 'Karte', 'Karten')} gezielt üben</button></div>
+        <div class="section-footer">Gezieltes Üben ändert deinen Lernplan nicht, zählt aber für den Wissensstand.</div>`
+        : '<div class="empty small"><div class="empty-icon">🏆</div><p>Keine Schwachstellen – alle gelernten Karten sitzen!</p></div>'}
+      </div>`
+      : `<div class="empty"><div class="empty-icon">📊</div><h3>Noch keine Antworten</h3>
+          <p>Lerne ein paar Karten, dann siehst du hier deinen Fortschritt.</p>
+          <button class="btn primary" data-a="learn-now">${I.play}Jetzt lernen</button></div>`}`;
+
+    const cap = $('.chart-caption', v.content);
+    if (cap) {
+      const x = days[selDay];
+      cap.innerHTML = `<b>${x.n}</b> ${x.n === 1 ? 'Antwort' : 'Antworten'} <span>· ${esc(x.long)}</span>`;
+    }
+    animateIn(v.content);
+  };
+
+  v.el.addEventListener('click', (e) => {
+    const day = e.target.closest('[data-day]');
+    if (day) {
+      selDay = +day.dataset.day;
+      lastK = deckKnowledge(deckId ? deckCards(deckId) : S.cards); // Kreis nicht neu animieren
+      v.render();
+      return;
+    }
+    const a = e.target.closest('[data-a]');
+    if (!a) return;
+    const cards = deckId ? deckCards(deckId) : S.cards;
+    if (a.dataset.a === 'card-detail') openCardDetail(a.dataset.id);
+    else if (a.dataset.a === 'practice-weak') startLearn({ cardIds: weakest(cards, 12).map((w) => w.card.id), practice: true });
+    else if (a.dataset.a === 'learn-now') startLearn({ deckIds: deckId ? [deckId] : S.decks.map((x) => x.id) });
+  });
+  return v;
+}
+
+/* ================= Karten-Detail ================= */
+function openCardDetail(cardId) {
+  const card = getCard(cardId);
+  if (!card) return;
+  const sh = openSheet({
+    title: 'Karte',
+    left: 'Schließen',
+    right: 'Bearbeiten',
+    compact: true,
+    onRight: () => {
+      sh.close();
+      setTimeout(() => { const c = getCard(cardId); if (c) openCardEditor({ card: c }); }, 320);
+    },
+  });
+  const hist = card.history || [];
+  const k = knowledge(hist);
+  const d = getDeck(card.deckId);
+  const s = card.srs;
+  const wrong = hist.filter((x) => x.r === 1).length;
+  const statusLine = k === null
+    ? '🆕 Noch nicht gelernt'
+    : isMastered(hist) ? '⭐ Gemeistert!' : k >= 60 ? '💪 Fast geschafft' : '🌱 Braucht noch Übung';
+  const nextLine = s.state === 'new' ? 'Kommt in der nächsten Lernrunde' : s.state === 'review' ? `Nächste Wiederholung ${relDue(s.due)}` : 'Gerade in der Lernphase';
+  sh.body.innerHTML = `
+    <div class="detail-card">
+      <div class="detail-deck">${esc(d ? `${d.emoji} ${d.name}` : '')}</div>
+      <div class="detail-front">${rich(card.front)}</div>
+      <div class="fc-divider"></div>
+      ${card.imageId ? `<img class="fc-img small" data-img="${card.imageId}" alt="">` : ''}
+      <div class="detail-back">${rich(card.back)}</div>
+    </div>
+    <div class="detail-score">
+      ${k === null ? '<div class="ring-empty">🆕</div>' : ringHTML(k, 84, 10, true)}
+      <div><div class="ds-status">${statusLine}</div>
+        <div class="ds-sub">${hist.length ? `${plural(hist.length, 'Antwort', 'Antworten')}${wrong ? ` · ${wrong}× falsch` : ''}` : 'Noch keine Antworten'}</div>
+        <div class="ds-sub">${nextLine}</div></div>
+    </div>
+    ${hist.length ? `
+    <div class="section"><div class="section-header">Verlauf</div>
+      <div class="chart-card">
+        <div class="dots" role="list">${hist.map((x, i) => `<button class="dot r${x.r} ${i === hist.length - 1 ? 'sel' : ''}" role="listitem" data-i="${i}"
+          aria-label="${esc(RATINGS[x.r].name)}, ${esc(fmtDateTime(x.t))}"></button>`).join('')}</div>
+        <div class="dot-caption" aria-live="polite"></div>
+        <div class="dot-legend">${[1, 2, 3, 4].map((r) => `<span><i class="r${r}"></i>${RATINGS[r].name}</span>`).join('')}</div>
+      </div></div>
+    <div class="section"><div class="section-header">Zuletzt</div><div class="group">
+      ${hist.slice(-6).reverse().map((x) => `<div class="row"><i class="dot r${x.r} static"></i><span class="row-main"><span class="row-title">${RATINGS[x.r].name}</span></span>
+        <span class="row-value small">${esc(fmtDateTime(x.t))}</span></div>`).join('')}
+    </div></div>` : `<div class="empty small"><p>Starte eine Lernrunde, dann siehst du hier, wie du diese Karte bewertet hast. 🚀</p></div>`}`;
+  hydrateImages(sh.body);
+  animateIn(sh.body);
+  const cap = $('.dot-caption', sh.body);
+  const showDot = (i) => {
+    const x = hist[i];
+    sh.body.querySelectorAll('.dot[data-i]').forEach((b) => b.classList.toggle('sel', +b.dataset.i === i));
+    if (cap) cap.innerHTML = `<b>${RATINGS[x.r].emoji} ${RATINGS[x.r].name}</b> · ${esc(fmtDateTime(x.t))}`;
+  };
+  if (hist.length) showDot(hist.length - 1);
+  sh.body.addEventListener('click', (e) => {
+    const dot = e.target.closest('.dot[data-i]');
+    if (dot) showDot(+dot.dataset.i);
+  });
+}
+
 /* ================= Einstellungen ================= */
 function SettingsView() {
   const v = makeView({ title: 'Einstellungen', backLabel: 'Karteikarten' });
@@ -1720,13 +2103,16 @@ function HelpView() {
       <h3>Lernen</h3>
       <p>Tippe auf eine Karte, um sie umzudrehen. Danach bewertest du, wie gut du sie wusstest:</p>
       <div class="rating-legend">
-        <span class="rate r1">Nochmal</span><span>Nicht gewusst – kommt gleich noch einmal.</span>
-        <span class="rate r2">Schwer</span><span>Mit Mühe gewusst – kommt bald wieder.</span>
+        <span class="rate r1">Falsch</span><span>Nicht gewusst – kommt gleich noch einmal.</span>
+        <span class="rate r2">Mühsam</span><span>Mit Mühe gewusst – kommt bald wieder.</span>
         <span class="rate r3">Gut</span><span>Gewusst – der Abstand wächst.</span>
         <span class="rate r4">Einfach</span><span>Sofort gewusst – kommt erst viel später.</span>
       </div>
       <p>Die App plant jede Karte nach dem Prinzip der verteilten Wiederholung (Spaced Repetition): Schwierige Karten kommen öfter, leichte immer seltener. Die Zeit auf den Knöpfen zeigt, wann die Karte wiederkommt.</p>
-      <p><b>Frei üben</b> geht alle Karten eines Stapels durch, ohne den Lernplan zu verändern.</p>
+      <h3>Wissensstand ⭐</h3>
+      <p>Jede Antwort wird mit Datum gespeichert. Daraus berechnet die App pro Karte einen Wissensstand in Prozent, wobei neuere Antworten stärker zählen als alte. Ab 85 % und mindestens drei Antworten gilt eine Karte als <b>gemeistert ⭐</b>.</p>
+      <p>Unter <b>Statistik</b> siehst du deine Antworten, die Verteilung und die Begriffe, die du noch üben solltest – mit einem Knopf, um genau diese Karten gezielt zu lernen.</p>
+      <p><b>Frei üben</b> geht alle Karten eines Stapels durch, ohne den Lernplan zu verändern. Die Antworten zählen trotzdem für den Wissensstand.</p>
       <h3>Karten mit Claude erstellen</h3>
       <ol><li>Tippe auf „Prompt für Claude kopieren“.</li>
       <li>Füge ihn in Claude ein und ersetze <span class="code">[THEMA]</span>.</li>
