@@ -3,7 +3,7 @@ import { schedule, newSrs, previewLabels, dayKey, relDue, fmtDays } from './srs.
 import { parseCards, CLAUDE_PROMPT } from './parser.js';
 import { RATINGS, knowledge, isMastered, deckKnowledge, scoreColor, distribution, weakest, HISTORY_MAX } from './score.js';
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
 /* ================= Hilfsfunktionen ================= */
@@ -75,6 +75,28 @@ const COLORS = ['#5856D6', '#007AFF', '#34C759', '#FF9500', '#FF3B30', '#AF52DE'
 const EMOJIS = ['📚', '🇬🇧', '🤝', '📊', '💼', '💡', '🧠', '🗣️', '📈', '💶', '🏢', '🛠️', '📝', '🎯', '🌍', '⚖️', '🧾', '📣', '💻', '🎓', '✈️', '⭐', '🔬', '🧩'];
 const DEFAULT_SETTINGS = { newPerDay: 20, lastBackup: null };
 
+/* Lernpakete: fertige Kartensätze mit festen IDs (erneutes Laden aktualisiert statt zu duplizieren). */
+const PACKS = {
+  sct: {
+    id: 'sct',
+    title: 'SCT-Lernpaket',
+    label: 'SCT-Lernpaket laden (150 Karten)',
+    blurb: '7 Stapel · Business, Sales, Finanzen, Glas & CERAN®',
+    url: 'packs/sct.json',
+  },
+};
+const PACK_DECK_STYLE = {
+  'Finanzen & Controlling': { emoji: '💶', color: '#34C759' },
+  'Pricing & kommerzielle Analyse': { emoji: '🏷️', color: '#FF9500' },
+  'Sales & Verhandlung': { emoji: '🤝', color: '#007AFF' },
+  'Markt, Kunden & Strategie': { emoji: '🧭', color: '#AF52DE' },
+  'Business English, Planung & Operations': { emoji: '🗣️', color: '#30B0C7' },
+  'Glas, Glaskeramik, Rohstoffe & Produktion': { emoji: '🧪', color: '#00C7BE' },
+  'CERAN®-Produkte & Produktvergleich': { emoji: '🍳', color: '#FF3B30' },
+};
+const slug = (s) => String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+const packDeckId = (packId, category) => `pack-${packId}-${slug(category)}`;
+
 const SEED = [
   {
     name: 'Business English', emoji: '🇬🇧', color: '#007AFF',
@@ -98,16 +120,18 @@ const SEED = [
   },
 ];
 
-const S = { decks: [], cards: [], settings: { ...DEFAULT_SETTINGS }, stats: { days: {} } };
+const S = { decks: [], cards: [], settings: { ...DEFAULT_SETTINGS }, stats: { days: {} }, packs: {} };
 
 async function load() {
-  const [decks, cards, settings, stats, seeded] = await Promise.all([
+  const [decks, cards, settings, stats, seeded, packs] = await Promise.all([
     db.getAll('decks'),
     db.getAll('cards'),
     db.getMeta('settings', {}),
     db.getMeta('stats', { days: {} }),
     db.getMeta('seeded', false),
+    db.getMeta('packs', {}),
   ]);
+  S.packs = packs || {};
   S.decks = decks;
   S.cards = cards;
   S.settings = { ...DEFAULT_SETTINGS, ...settings };
@@ -234,6 +258,42 @@ function cardStatus(c, now = Date.now()) {
   return { cls: '', text: relDue(s.due, now) };
 }
 
+/* ================= Kartendarstellung ================= */
+function prioBadge(c, long = false) {
+  const p = Number(c.priority);
+  if (!p) return '';
+  return `<span class="prio p${Math.min(p, 3)}" title="Priorität ${p}${p === 1 ? ' – zuerst lernen' : ''}">${long ? `Prio ${p}` : `P${p}`}</span>`;
+}
+
+const exampleIcon = (kind = '') => (/englisch/i.test(kind) ? '🗣️' : /fiktiv|praxis/i.test(kind) ? '📌' : /produkt|ceran/i.test(kind) ? '🍳' : '🔎');
+
+/** Rückseite: strukturierte Lernpaket-Karten schön formatiert, sonst der Freitext. */
+function backBodyHTML(c) {
+  const f = c.fields;
+  if (!f) {
+    if (!c.back) return '';
+    const long = c.back.length > 140 || c.back.includes('\n');
+    return `<div class="fc-answer ${long ? 'long' : ''}">${rich(c.back)}</div>`;
+  }
+  return `<div class="fs">
+    ${f.definition ? `<p class="fs-def">${rich(f.definition)}</p>` : ''}
+    ${f.formula ? `<div class="fs-formula"><span class="fs-label">🧮 Formel</span><div class="fs-formula-body">${rich(f.formula)}</div></div>` : ''}
+    ${f.example ? `<div class="fs-example"><span class="fs-label">${exampleIcon(f.example_kind)} ${esc(f.example_kind || 'Beispiel')}</span><p>${rich(f.example)}</p></div>` : ''}
+    ${f.note ? `<div class="fs-note"><span class="fs-note-title">💡 Merke</span><p>${rich(f.note)}</p></div>` : ''}
+  </div>`;
+}
+
+const cardSnippet = (c) => plain(c.fields?.definition || c.back);
+
+function packRowHTML(id = 'sct') {
+  const p = PACKS[id];
+  const st = S.packs[id];
+  return `<button class="row" data-pack="${id}"><span class="tile pack-tile">📦</span>
+    <span class="row-main"><span class="row-title">${esc(p.label)}</span>
+    <span class="row-sub">${st ? `✅ Geladen am ${fmtDate(st.loaded)} · erneut laden aktualisiert` : esc(p.blurb)}</span></span>
+    <span class="chev">${I.chev}</span></button>`;
+}
+
 /* ================= Wissensstand-Bausteine ================= */
 function scoreBadge(c) {
   const k = knowledge(c.history);
@@ -334,6 +394,10 @@ const fmtDateTime = (ts) => {
   return today ? `heute, ${time}` : `${d.toLocaleDateString('de-DE', { day: 'numeric', month: 'short' })}, ${time}`;
 };
 
+/** Neue Karten: Priorität 1 vor 2 vor 3; eigene Karten ohne Priorität zählen wie Priorität 1. */
+const prioOf = (c) => (Number(c.priority) > 0 ? Number(c.priority) : 1);
+const byPriority = (a, b) => prioOf(a) - prioOf(b) || a.created - b.created;
+
 function buildQueue(deckIds) {
   const now = Date.now();
   const due = [];
@@ -342,8 +406,9 @@ function buildQueue(deckIds) {
     const cs = deckCards(id);
     const cnt = deckCounts(id, now);
     due.push(...cs.filter((c) => c.srs.state !== 'new' && c.srs.due <= now));
-    fresh.push(...cs.filter((c) => c.srs.state === 'new').sort((a, b) => a.created - b.created).slice(0, cnt.newAvail));
+    fresh.push(...cs.filter((c) => c.srs.state === 'new').sort(byPriority).slice(0, cnt.newAvail));
   }
+  fresh.sort(byPriority); // Priorität 1 zuerst, auch über mehrere Stapel hinweg
   const learning = due.filter((c) => c.srs.state !== 'review').sort((a, b) => a.srs.due - b.srs.due);
   const reviews = shuffle(due.filter((c) => c.srs.state === 'review'));
   const mixed = [];
@@ -815,6 +880,7 @@ function HomeView() {
             <span class="row-main"><span class="row-title">Aus Text importieren</span></span><span class="chev">${I.chev}</span></button>
           <button class="row" data-a="copy-prompt"><span class="tile" style="background:var(--orange)">${I.sparkles}</span>
             <span class="row-main"><span class="row-title">Prompt für Claude kopieren</span></span></button>
+          ${packRowHTML('sct')}
         </div>
         <div class="section-footer">Lass dir von Claude Karten erstellen, kopiere die Antwort und füge sie hier ein.</div></div>`;
     animateIn(v.content);
@@ -893,9 +959,9 @@ function DeckView(deckId) {
     listEl.innerHTML = `<div class="section"><div class="section-header">${plural(list.length, 'Karte', 'Karten')}</div>
       <div class="group">${shown
         .map((c) => `<button class="row" data-a="card-detail" data-id="${c.id}">
-            <span class="row-main"><span class="row-title">${esc(plain(c.front))}</span><span class="row-sub">${esc(plain(c.back))}</span></span>
+            <span class="row-main"><span class="row-title">${esc(plain(c.front))}</span><span class="row-sub">${esc(cardSnippet(c))}</span></span>
             ${c.imageId ? `<span class="photo-ind">${I.photo}</span>` : ''}
-            ${scoreBadge(c)}</button>`)
+            ${prioBadge(c)}${scoreBadge(c)}</button>`)
         .join('')}</div>
       ${list.length > shown.length ? `<div class="section-footer">… und ${list.length - shown.length} weitere. Nutze die Suche.</div>` : ''}</div>`;
   }
@@ -1099,7 +1165,9 @@ function openCardEditor({ card = null, deckId = null, onSaved, onDeleted } = {})
       <div class="group"><textarea class="field" data-f="front" rows="1" placeholder="z. B. Deckungsbeitrag" style="min-height:52px"></textarea></div></div>
     <div class="section"><div class="section-header">Rückseite · Erklärung</div>
       <div class="group"><textarea class="field" data-f="back" rows="4" placeholder="Erklärung, Beispiel …"></textarea></div>
-      <div class="section-footer">Tipp: **Wort** wird auf der Karte fett angezeigt.</div></div>
+      <div class="section-footer">${card?.fields
+        ? `📦 Karte aus dem ${esc(PACKS[card.pack]?.title || 'Lernpaket')} (${esc(card.id)}). Die Rückseite wird formatiert angezeigt. Änderst du sie hier, ersetzt dein Text die Formatierung. Erneutes Laden des Pakets stellt sie wieder her.`
+        : 'Tipp: **Wort** wird auf der Karte fett angezeigt.'}</div></div>
     <div class="section"><div class="section-header">Bild (optional)</div><div class="group" data-img-group></div></div>
     ${isNew
       ? '<div class="section pad"><button class="btn secondary" data-a="save-next">Sichern & nächste Karte</button></div>'
@@ -1199,6 +1267,7 @@ function openCardEditor({ card = null, deckId = null, onSaved, onDeleted } = {})
     const now = Date.now();
     const base = isNew ? { id: uid(), created: now, srs: newSrs(), imageId: null } : { ...(getCard(card.id) || card) };
     const c = { ...base, front: f, back: b, deckId: deckSel.value, imageSide: side };
+    if (c.fields && b !== String(base.back || '').trim()) c.fields = null;
     const ops = [];
     if (img.action === 'new') {
       const id = uid();
@@ -1303,17 +1372,14 @@ function startLearn({ deckIds = [], cardIds = null, practice = false }) {
       : isMastered(c.history)
         ? `<span class="fc-tag star">⭐ ${k} %</span>`
         : `<span class="fc-tag" style="--sc:${scoreColor(k)}">${k} %</span>`;
-    return `${tag}<div class="fc-inner">${c.imageSide === 'front' ? imgTag(c) : ''}
+    return `${tag}${c.priority ? `<span class="fc-prio">${prioBadge(c, true)}</span>` : ''}<div class="fc-inner">${c.imageSide === 'front' ? imgTag(c) : ''}
       <div class="fc-term ${c.front.length > 60 ? 'long' : ''}">${rich(c.front)}</div></div>
       <div class="fc-hint">👆 Tippen zum Umdrehen</div>`;
   };
-  const backHTML = (c) => {
-    const long = c.back.length > 140 || c.back.includes('\n');
-    return `<div class="fc-inner"><div class="fc-term small">${rich(c.front)}</div>
+  const backHTML = (c) => `<div class="fc-inner"><div class="fc-term small">${rich(c.front)}</div>
       ${c.imageSide === 'front' ? imgTag(c, true) : ''}<div class="fc-divider"></div>
       ${c.imageSide !== 'front' ? imgTag(c) : ''}
-      ${c.back ? `<div class="fc-answer ${long ? 'long' : ''}">${rich(c.back)}</div>` : ''}</div>`;
-  };
+      ${backBodyHTML(c)}</div>`;
 
   const sessionSize = new Set(queue).size;
   function progress() {
@@ -1560,7 +1626,8 @@ function openImport({ deckId = null, text = '' } = {}) {
   sh.setRightEnabled(false);
   const defDeck = deckId || S.decks[0]?.id || '';
   sh.body.innerHTML = `
-    <div class="section"><div class="group"><textarea class="field" data-f="text" placeholder="Hier den Text von Claude einfügen, z. B.:
+    <div class="section"><div class="section-header">Lernpaket</div><div class="group has-tiles">${packRowHTML('sct')}</div></div>
+    <div class="section"><div class="section-header">Eigener Text</div><div class="group"><textarea class="field" data-f="text" placeholder="Hier den Text von Claude einfügen, z. B.:
 
 # Sales
 Pipeline | Alle laufenden Verkaufschancen
@@ -1741,6 +1808,101 @@ A: Antwort (auch mehrzeilig)</div></div>
   }
 }
 
+/* ================= Lernpakete ================= */
+async function loadPack(packId) {
+  const pack = PACKS[packId];
+  if (!pack) return;
+  let data;
+  try {
+    const res = await fetch(pack.url, { cache: 'no-cache' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (err) {
+    alertBox({ title: 'Lernpaket nicht verfügbar', message: `Das Paket konnte nicht geladen werden. Bist du online?\n(${err?.message || err})` });
+    return;
+  }
+  const cards = (Array.isArray(data?.cards) ? data.cards : []).filter((c) => c && c.id && c.front && (c.back || c.definition));
+  if (!cards.length) {
+    alertBox({ title: 'Lernpaket leer', message: 'In der Paketdatei wurden keine Karten gefunden.' });
+    return;
+  }
+  const categories = [...new Set(cards.map((c) => c.category || pack.title))];
+  const existing = cards.filter((c) => getCard(String(c.id))).length;
+  const fresh = cards.length - existing;
+  const go = await alertBox({
+    title: `📦 ${pack.title}`,
+    message: `${plural(cards.length, 'Karte', 'Karten')} in ${plural(categories.length, 'Stapel', 'Stapeln')}.\n${[
+      fresh ? `${fresh} neu` : '',
+      existing ? `${existing} ${existing === 1 ? 'wird' : 'werden'} aktualisiert – dein Lernfortschritt bleibt erhalten` : '',
+    ].filter(Boolean).join(' · ')}.`,
+    buttons: [{ text: 'Abbrechen', value: false }, { text: fresh ? 'Laden' : 'Aktualisieren', value: true, style: 'bold' }],
+  });
+  if (!go) return;
+
+  const now = Date.now();
+  const ops = [];
+  const newDecks = [];
+  let order = Math.max(-1, ...S.decks.map((x) => x.order ?? 0));
+  const deckFor = (cat) => {
+    const id = packDeckId(packId, cat);
+    const d = getDeck(id) || newDecks.find((x) => x.id === id) || findDeckByName(cat);
+    if (d) return d.id;
+    const style = PACK_DECK_STYLE[cat] || { emoji: '📚', color: COLORS[(S.decks.length + newDecks.length) % COLORS.length] };
+    const nd = { id, name: cat, emoji: style.emoji, color: style.color, created: now, order: ++order, pack: packId };
+    newDecks.push(nd);
+    ops.push({ store: 'decks', op: 'put', value: nd });
+    return id;
+  };
+  const touched = [];
+  cards.forEach((c, i) => {
+    const id = String(c.id);
+    const ex = getCard(id);
+    const content = {
+      front: String(c.front),
+      back: String(c.back || c.definition || ''),
+      fields: {
+        definition: c.definition || '',
+        formula: c.formula || '',
+        example: c.example || '',
+        example_kind: c.example_kind || '',
+        note: c.note || '',
+      },
+      priority: Number(c.priority) || null,
+      sources: Array.isArray(c.source_ids) ? c.source_ids : [],
+      pack: packId,
+    };
+    const deckId = ex && getDeck(ex.deckId) ? ex.deckId : deckFor(c.category || pack.title);
+    const card = ex
+      ? { ...ex, ...content, deckId, updated: now } // Lernplan & Verlauf bleiben erhalten
+      : { id, deckId, imageId: null, imageSide: 'back', created: now + i, updated: now + i, srs: newSrs(), history: [], ...content };
+    touched.push(card);
+    ops.push({ store: 'cards', op: 'put', value: card });
+  });
+  const packs = { ...S.packs, [packId]: { loaded: now, count: cards.length, sources: Array.isArray(data.sources) ? data.sources : [] } };
+  ops.push({ store: 'meta', op: 'put', value: { key: 'packs', value: packs } });
+  try {
+    await db.bulk(ops);
+  } catch (err) {
+    alertBox({ title: 'Laden fehlgeschlagen', message: err?.message || String(err) });
+    return;
+  }
+  S.decks.push(...newDecks);
+  sortDecks();
+  touched.forEach(upsertLocal);
+  S.packs = packs;
+  overlay.querySelectorAll('.sheet.open .sh-left').forEach((b) => b.click()); // offenes Import-Sheet schließen
+  refresh();
+  if (fresh) {
+    confetti();
+    toast(`🎉 ${plural(fresh, 'Karte', 'Karten')} geladen${existing ? `, ${existing} aktualisiert` : ''}`);
+  } else toast(`✅ ${plural(existing, 'Karte', 'Karten')} aktualisiert`);
+}
+
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-pack]');
+  if (b) loadPack(b.dataset.pack);
+});
+
 /* ================= Backup ================= */
 async function createBackup() {
   let file;
@@ -1751,7 +1913,7 @@ async function createBackup() {
     for (const im of images) imgs[im.id] = { type: im.type, data: await blobToDataURL(new Blob([im.data], { type: im.type })) };
     const data = {
       app: 'karteikarten', version: 1, exported: new Date().toISOString(),
-      decks: S.decks, cards: S.cards, images: imgs, settings: S.settings, stats: S.stats,
+      decks: S.decks, cards: S.cards, images: imgs, settings: S.settings, stats: S.stats, packs: S.packs,
     };
     const json = JSON.stringify(data);
     size = json.length;
@@ -1838,6 +2000,9 @@ async function restoreFromFile(file) {
     const days = replace ? { ...data.stats.days } : { ...S.stats.days };
     if (!replace) for (const [k, n] of Object.entries(data.stats.days)) days[k] = Math.max(days[k] || 0, n);
     ops.push({ store: 'meta', op: 'put', value: { key: 'stats', value: { days } } });
+  }
+  if (data.packs && typeof data.packs === 'object') {
+    ops.push({ store: 'meta', op: 'put', value: { key: 'packs', value: replace ? data.packs : { ...data.packs, ...S.packs } } });
   }
   if (replace && data.settings) ops.push({ store: 'meta', op: 'put', value: { key: 'settings', value: { ...DEFAULT_SETTINGS, ...data.settings } } });
   try {
@@ -1957,6 +2122,20 @@ function StatsView(deckId = null) {
 }
 
 /* ================= Karten-Detail ================= */
+function sourcesHTML(card) {
+  const all = S.packs[card.pack]?.sources || [];
+  const list = (card.sources || []).map((id) => all.find((x) => x.id === id)).filter(Boolean);
+  if (!list.length) return '';
+  return `<div class="section"><div class="section-header">Quellen</div><div class="group">${list
+    .map((q) => {
+      const url = /^https?:\/\//i.test(q.url || '') ? q.url : '';
+      const inner = `<span class="row-main"><span class="row-title wrap">${esc(q.title || q.id)}</span>
+        <span class="row-sub wrap">${esc([q.author, q.section].filter(Boolean).join(' · '))}</span></span>`;
+      return url ? `<a class="row" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${inner}<span class="chev">${I.chev}</span></a>` : `<div class="row">${inner}</div>`;
+    })
+    .join('')}</div>${list.some((q) => q.note) ? `<div class="section-footer">${esc(list.map((q) => q.note).filter(Boolean).join(' '))}</div>` : ''}</div>`;
+}
+
 function openCardDetail(cardId) {
   const card = getCard(cardId);
   if (!card) return;
@@ -1981,11 +2160,11 @@ function openCardDetail(cardId) {
   const nextLine = s.state === 'new' ? 'Kommt in der nächsten Lernrunde' : s.state === 'review' ? `Nächste Wiederholung ${relDue(s.due)}` : 'Gerade in der Lernphase';
   sh.body.innerHTML = `
     <div class="detail-card">
-      <div class="detail-deck">${esc(d ? `${d.emoji} ${d.name}` : '')}</div>
+      <div class="detail-deck">${esc(d ? `${d.emoji} ${d.name}` : '')}${card.priority ? ` · ${prioBadge(card, true)}${Number(card.priority) === 1 ? ' <span class="prio-hint">zuerst lernen</span>' : ''}` : ''}</div>
       <div class="detail-front">${rich(card.front)}</div>
       <div class="fc-divider"></div>
       ${card.imageId ? `<img class="fc-img small" data-img="${card.imageId}" alt="">` : ''}
-      <div class="detail-back">${rich(card.back)}</div>
+      <div class="detail-back">${backBodyHTML(card)}</div>
     </div>
     <div class="detail-score">
       ${k === null ? '<div class="ring-empty">🆕</div>' : ringHTML(k, 84, 10, true)}
@@ -2004,7 +2183,8 @@ function openCardDetail(cardId) {
     <div class="section"><div class="section-header">Zuletzt</div><div class="group">
       ${hist.slice(-6).reverse().map((x) => `<div class="row"><i class="dot r${x.r} static"></i><span class="row-main"><span class="row-title">${RATINGS[x.r].name}</span></span>
         <span class="row-value small">${esc(fmtDateTime(x.t))}</span></div>`).join('')}
-    </div></div>` : `<div class="empty small"><p>Starte eine Lernrunde, dann siehst du hier, wie du diese Karte bewertet hast. 🚀</p></div>`}`;
+    </div></div>` : `<div class="empty small"><p>Starte eine Lernrunde, dann siehst du hier, wie du diese Karte bewertet hast. 🚀</p></div>`}
+    ${sourcesHTML(card)}`;
   hydrateImages(sh.body);
   animateIn(sh.body);
   const cap = $('.dot-caption', sh.body);
@@ -2035,7 +2215,8 @@ function SettingsView() {
         <button class="row" data-a="import"><span class="tile" style="background:var(--teal)">${I.doc}</span>
           <span class="row-main"><span class="row-title">Aus Text importieren</span></span><span class="chev">${I.chev}</span></button>
         <button class="row" data-a="prompt"><span class="tile" style="background:var(--orange)">${I.sparkles}</span>
-          <span class="row-main"><span class="row-title">Prompt für Claude kopieren</span></span></button></div></div>
+          <span class="row-main"><span class="row-title">Prompt für Claude kopieren</span></span></button>
+        ${packRowHTML('sct')}</div></div>
       <div class="section"><div class="section-header">Backup</div><div class="group has-tiles">
         <button class="row" data-a="backup"><span class="tile" style="background:var(--green)">${I.share}</span>
           <span class="row-main"><span class="row-title">Backup erstellen</span><span class="row-sub">${lb ? `Zuletzt: ${fmtDate(lb)}` : 'Noch kein Backup erstellt'}</span></span><span class="chev">${I.chev}</span></button>
@@ -2120,6 +2301,8 @@ function HelpView() {
       <li>Öffne „Aus Text importieren“ und tippe auf „Einfügen“.</li></ol>
       <p>Der Prompt:</p>
       <div class="code-block">${esc(CLAUDE_PROMPT)}</div>
+      <h3>Lernpakete 📦</h3>
+      <p>Unter „Karten hinzufügen“ lädst du das SCT-Lernpaket mit 150 Karten in 7 Stapeln. Karten mit <b>Priorität 1</b> kommen beim Lernen zuerst. Lädst du das Paket später erneut, werden die Karten aktualisiert – dein Lernfortschritt bleibt erhalten.</p>
       <h3>Backup</h3>
       <p>Alle Daten liegen nur auf diesem Gerät, nichts wird hochgeladen. Unter Einstellungen → „Backup erstellen“ sicherst du alles als Datei, z. B. in iCloud Drive. Mit „Backup wiederherstellen“ holst du sie zurück, auch auf einem neuen iPhone.</p>
       <p>Wichtig: Nutze die App immer über das Symbol auf dem Home-Bildschirm. Safari und die installierte App haben getrennte Speicher.</p>

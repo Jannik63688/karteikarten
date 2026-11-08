@@ -1152,3 +1152,47 @@ textarea.field { min-height: 92px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* ===== v1.2: Lernpakete ===== */
+.pack-tile { background: linear-gradient(135deg, #ff9600, #ff4b4b); font-size: 16px; }
+.prio {
+  flex: none;
+  display: inline-block;
+  padding: 3px 7px;
+  border-radius: 7px;
+  font-family: var(--rounded);
+  font-size: 11.5px;
+  font-weight: 800;
+  line-height: 1.2;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+.prio.p1 { color: #d93a3a; background: rgba(242, 72, 72, 0.13); }
+.prio.p2 { color: #b07a00; background: rgba(255, 200, 0, 0.2); }
+.prio.p3 { color: var(--label2); background: var(--fill); }
+@media (prefers-color-scheme: dark) {
+  .prio.p1 { color: #ff7a7a; }
+  .prio.p2 { color: #ffd34d; }
+}
+.fc-prio { position: absolute; top: 16px; right: 18px; }
+.prio-hint { font-size: 12px; color: var(--label2); font-weight: 500; }
+a.row { color: inherit; text-decoration: none; }
+.row-sub.wrap { white-space: normal; }
+
+/* Strukturierte Rückseite */
+.fs { align-self: stretch; display: flex; flex-direction: column; gap: 10px; text-align: left; -webkit-user-select: text; user-select: text; }
+.fs p { margin: 0; }
+.fs-def { font-size: 18px; line-height: 1.4; font-weight: 500; }
+.fs-label { display: block; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--label2); margin-bottom: 4px; }
+.fs-formula { padding: 12px 14px; border-radius: 14px; background: var(--accent-soft); box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
+.fs-formula .fs-label { color: var(--accent); }
+.fs-formula-body { font-family: var(--rounded); font-size: 17px; font-weight: 800; line-height: 1.35; color: var(--label); word-break: break-word; }
+.fs-example { padding: 10px 14px; border-radius: 14px; background: var(--bg); }
+.fs-example p { font-size: 15.5px; line-height: 1.42; }
+.fs-note { padding: 10px 14px 12px; border-radius: 14px; background: rgba(255, 200, 0, 0.16); box-shadow: inset 4px 0 0 var(--c-hard); }
+.fs-note-title { display: block; font-family: var(--rounded); font-size: 14px; font-weight: 800; color: #9a6b00; margin-bottom: 3px; }
+.fs-note p { font-size: 15.5px; line-height: 1.4; font-weight: 600; }
+@media (prefers-color-scheme: dark) { .fs-note-title { color: #ffd34d; } }
+.detail-back .fs-def { font-size: 17px; }
+.detail-back .fs-formula-body { font-size: 16px; }
+.detail-back .fs-example p, .detail-back .fs-note p { font-size: 15px; }

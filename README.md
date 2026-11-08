@@ -7,6 +7,9 @@ Persönliche Karteikarten-App fürs iPhone (PWA): eigene Stapel, Karten mit Bild
 ## Aufs iPhone
 Link in **Safari** öffnen → Teilen-Symbol → **„Zum Home-Bildschirm“**.
 
+## Lernpaket
+`packs/sct.json` enthält das SCT-Lernpaket (150 Karten, nur `cards` und `sources`). Es wird in der App unter „Karten hinzufügen“ geladen; feste IDs sorgen dafür, dass erneutes Laden Karten aktualisiert, ohne den Lernfortschritt zu verlieren.
+
 ## Technik
 - Reines HTML/CSS/JavaScript ohne Build-Schritt
 - IndexedDB für Karten und Bilder, Service Worker für Offline-Betrieb
